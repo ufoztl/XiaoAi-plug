@@ -316,11 +316,26 @@ class UiAutoService : AccessibilityService() {
         return r.width() > 0 && r.height() > 0 && r.right > 0 && r.bottom > 0
     }
 
+    /** Package names and window metadata only: never log on-screen text or passwords. */
+    private fun windowDebugSummary(): String = (windows ?: emptyList()).take(12).joinToString("; ") { w ->
+        val r = Rect()
+        w.getBoundsInScreen(r)
+        val node = w.root
+        val pkg = node?.packageName?.toString() ?: "?"
+        "$pkg(type=${w.type},focused=${w.isFocused},active=${w.isActive}," +
+            "children=${node?.childCount ?: -1},size=${r.width()}x${r.height()})"
+    }
+
     fun observe(): String = synchronized(uiLock) {
         val snap = takeSnapshot()
-            ?: return "error: WINDOW_NOT_VISIBLE 未能从无障碍窗口列表读取目标页面"
-        if (snap.pkg == "com.miui.home" && snap.elements.isEmpty())
-            return "error: WINDOW_NOT_VISIBLE 只能读取空白桌面，目标页面可能未被系统无障碍暴露"
+        if (snap == null || snap.elements.isEmpty()) {
+            val pkg = snap?.pkg ?: "none"
+            val summary = windowDebugSummary()
+            Log.w(TAG, "ui_observe empty: selected=$pkg windows=$summary")
+            return "error: WINDOW_NOT_VISIBLE 读取到的应用为 $pkg，但没有可操作的控件。" +
+                "窗口诊断: $summary。不要把该结果当成空白屏幕或操作成功；" +
+                "请停止重复点击，告知用户无法可靠读取界面。"
+        }
         UiPolicy.formatSnapshot(snap.id, snap.pkg, snap.elements, snap.truncated)
     }
 
@@ -329,20 +344,25 @@ class UiAutoService : AccessibilityService() {
         val nodes = ArrayList<AccessibilityNodeInfo>()
         val elements = ArrayList<UiPolicy.Element>()
         var truncated = false
+        var examined = 0
         val bounds = Rect()
 
         // 可点击容器(列表项、卡片)的文字子节点已经拼进容器的标签里,不再单列;
         // 但容器里另有可交互的子控件(列表项里的开关)照样列出来。
         fun visit(n: AccessibilityNodeInfo?, depth: Int, underClickable: Boolean) {
-            if (n == null || depth > 40 || !onScreen(n, bounds)) return
+            if (n == null || depth > 40) return
+            if (++examined > 4000) { truncated = true; return }
             if (nodes.size >= MAX_UI_ELEMENTS) { truncated = true; return }
+            val visible = onScreen(n, bounds)
+            // Some HyperOS windows report an invisible/zero-sized root while its
+            // descendants still have valid geometry. Do not discard the subtree.
             val interactive = n.isClickable || n.isEditable || n.isScrollable || n.isCheckable
-            val own = ownText(n)
-            if (interactive || (own.isNotEmpty() && !underClickable)) {
+            val own = if (visible) ownText(n) else ""
+            if (visible && (interactive || (own.isNotEmpty() && !underClickable))) {
                 nodes.add(n)
                 elements.add(elementOf(n, own))
             }
-            val clickableContainer = n.isClickable && !n.isScrollable && !n.isEditable
+            val clickableContainer = visible && n.isClickable && !n.isScrollable && !n.isEditable
             for (i in 0 until n.childCount) visit(n.getChild(i), depth + 1, underClickable || clickableContainer)
         }
         visit(root, 0, false)
