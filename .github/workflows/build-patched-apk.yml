@@ -19,7 +19,12 @@ jobs:
           SDKMANAGER="$(find /usr/local/lib/android/sdk/cmdline-tools -type f -name sdkmanager | head -n 1)"
           test -n "$SDKMANAGER"
           yes | "$SDKMANAGER" --licenses >/dev/null || true
-          "$SDKMANAGER" --channel=3 --install 'platforms;android-37' 'build-tools;36.0.0'
+          "$SDKMANAGER" --channel=3 --install 'platforms;android-37.0' 'build-tools;36.0.0'
+          SDK_ROOT="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          if [ -d "$SDK_ROOT/platforms/android-37.0" ] && [ ! -e "$SDK_ROOT/platforms/android-37" ]; then
+            ln -s "$SDK_ROOT/platforms/android-37.0" "$SDK_ROOT/platforms/android-37"
+          fi
+          ls -ld "$SDK_ROOT/platforms/android-37"*
       - name: Test and build
         run: |
           chmod +x ./gradlew
