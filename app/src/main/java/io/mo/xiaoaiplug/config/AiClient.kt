@@ -202,6 +202,7 @@ object AiClient {
         val loopStart = System.currentTimeMillis()
         // 上一轮有动作被 allowMutating 拦下:这轮动不了手,再给工具只会换着法子重试。
         var actionBlocked = false
+        var consecutiveUnreadableWindows = 0
         for (iter in 0 until MAX_TOOL_ITERATIONS) {
             // 第 0 轮还没有任何工具结果,不存在"凭已有结果作答",所以收尾轮最早从第 1 轮起。
             val forceAnswer = iter > 0 && (
@@ -267,6 +268,17 @@ object AiClient {
                         to System.currentTimeMillis() - toolAt
             )
             if (results.any { it.startsWith(Tools.MUTATING_BLOCKED) }) actionBlocked = true
+            val missingWindow = calls.zip(results).any { (call, result) ->
+                call.name == "ui_observe" && result.startsWith("error: WINDOW_NOT_VISIBLE")
+            }
+            if (missingWindow) consecutiveUnreadableWindows++
+            else if (calls.any { it.name == "ui_observe" || it.name == "ui_act" })
+                consecutiveUnreadableWindows = 0
+            if (consecutiveUnreadableWindows >= 2) {
+                val explanation = "当前目标窗口无法被无障碍读取，已停止重复尝试。无法确认操作成功，请手动检查。"
+                sink?.onComplete(explanation)
+                return explanation
+            }
 
             if (calls.any { it.id != null }) {
                 // 原生协议:每个调用一条 role=tool 消息
@@ -386,7 +398,8 @@ object AiClient {
         return try {
             request(config, messages, specs, sink)
         } catch (t: HttpError) {
-            if (specs.isNotEmpty() && t.code == 400) {
+            if (specs.isNotEmpty() && t.code == 400 &&
+                !OpenAiModelPolicy.useResponses(config.effectiveModel, config.effectiveEndpoint)) {
                 Log.w(TAG, "endpoint rejected native tools (400), falling back to text convention: ${t.body.take(200)}")
                 LogClient.error(
                     ctx,
@@ -418,11 +431,56 @@ object AiClient {
         noToolCalls: Boolean = false
     ): JSONObject = when (config.aiProvider.wire) {
         AiProvider.Wire.OPENAI ->
-            if (sink != null) postOpenAiStream(config, messages, specs, sink, noToolCalls)
+            if (OpenAiModelPolicy.useResponses(config.effectiveModel, config.effectiveEndpoint))
+                postOpenAiResponses(config, messages, specs, sink, noToolCalls)
+            else if (sink != null) postOpenAiStream(config, messages, specs, sink, noToolCalls)
             else postOpenAi(config, messages, specs, noToolCalls)
         AiProvider.Wire.ANTHROPIC ->
             if (sink != null) postAnthropicStream(config, messages, specs, sink, noToolCalls)
             else postAnthropic(config, messages, specs, noToolCalls)
+    }
+
+    /** GPT-6.1 Sol and GPT-6 Astra use Responses API rather than Chat Completions.
+     * Tool loops are translated to the current client's internal Chat message format.
+     */
+    private fun postOpenAiResponses(
+        config: AiConfig, messages: JSONArray, specs: List<Tools.Spec>,
+        sink: StreamSink?, noToolCalls: Boolean
+    ): JSONObject {
+        val base = config.effectiveEndpoint.trimEnd('/')
+            .removeSuffix("/chat/completions").removeSuffix("/responses")
+        val url = URL("$base/responses")
+        val headers = HashMap<String, String>()
+        if (config.apiKey.isNotBlank()) headers["Authorization"] = "Bearer ${config.apiKey}"
+        val body = OpenAiResponsesCompat.requestBody(
+            config.effectiveModel, messages, Tools.toOpenAiSchema(specs), noToolCalls
+        )
+        if (sink == null) return OpenAiResponsesCompat.toChatMessage(postJson(url, headers, body))
+        var finished: JSONObject? = null
+        val streamed = StringBuilder()
+        body.put("stream", true)
+        postJsonStream(url, headers, body) { payload ->
+            val event = runCatching { JSONObject(payload) }.getOrNull() ?: return@postJsonStream
+            when (event.optString("type")) {
+                "response.output_text.delta" -> {
+                    val delta = event.optString("delta", "")
+                    if (delta.isNotEmpty()) {
+                        streamed.append(delta)
+                        sink.onDelta(streamed.toString())
+                    }
+                }
+                "response.completed" -> finished = event.optJSONObject("response")
+                "response.failed" -> throw IllegalStateException(
+                    "Responses failed: " +
+                    (event.optJSONObject("response")?.optJSONObject("error")?.optString("message") ?: "unknown error")
+                )
+            }
+        }
+        val response = finished ?: throw IllegalStateException("Responses stream ended without response.completed")
+        val msg = OpenAiResponsesCompat.toChatMessage(response)
+        val answer = AiResponseText.fromMessage(msg).answer
+        if (answer.isNotBlank()) sink.onComplete(answer) else sink.onDiscard()
+        return msg
     }
 
     private class HttpError(val code: Int, val body: String) : RuntimeException("HTTP $code: $body")
@@ -437,6 +495,9 @@ object AiClient {
         val body = JSONObject()
             .put("model", config.effectiveModel)
             .put("messages", messages)
+        OpenAiModelPolicy.chatReasoningEffort(config.effectiveModel)?.let {
+            body.put("reasoning_effort", it)
+        }
         if (specs.isNotEmpty()) {
             body.put("tools", Tools.toOpenAiSchema(specs))
             body.put("tool_choice", if (noToolCalls) "none" else "auto")

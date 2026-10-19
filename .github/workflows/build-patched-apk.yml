@@ -1,0 +1,28 @@
+name: Build XiaoAi Plug patched APK
+on:
+  workflow_dispatch:
+  push:
+    branches: [ xiaoai-fixed ]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: android-actions/setup-android@v3
+      - name: Install Android SDK 37
+        run: sdkmanager --install 'platforms;android-37' 'build-tools;37.0.0'
+      - name: Test and build
+        run: |
+          chmod +x ./gradlew
+          ./gradlew :app:testDebugUnitTest :app:assembleDebug --no-daemon --stacktrace
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: XiaoAiPlug-universal-patched-DEBUG
+          path: app/build/outputs/apk/debug/app-debug.apk

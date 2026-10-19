@@ -251,19 +251,60 @@ class UiAutoService : AccessibilityService() {
      * MIUI 的 systemui 插件(`miui.systemui.plugin`,小爱悬浮球就挂在它上面)也得跳:
      * 真机上坐标点击点到悬浮层后,快照就被它顶成了前台。
      */
-    private fun foregroundRoot(): AccessibilityNodeInfo? = (windows ?: emptyList())
-        .sortedByDescending { it.layer }
-        .mapNotNull { it.root }
-        .firstOrNull { isAppWindow(it.packageName?.toString()) }
-        ?: rootInActiveWindow
+    /** Avoid selecting the launcher behind the real foreground Activity.
+     * Distinguish full-sized assistant Activities from assistant overlays.
+     */
+    private data class ForegroundCandidate(
+        val root: AccessibilityNodeInfo, val pkg: String,
+        val layer: Int, val focused: Boolean, val active: Boolean
+    )
 
-    private fun isAppWindow(p: String?): Boolean =
-        p != null && p != VOICE_ASSIST && p != SELF_PKG &&
-            !p.startsWith("com.android.systemui") && !p.startsWith("miui.systemui")
+    private fun windowIsLarge(w: android.view.accessibility.AccessibilityWindowInfo): Boolean {
+        val r = Rect()
+        w.getBoundsInScreen(r)
+        val dm = resources.displayMetrics
+        val screenArea = dm.widthPixels.toLong() * dm.heightPixels.toLong()
+        val area = r.width().coerceAtLeast(0).toLong() * r.height().coerceAtLeast(0).toLong()
+        return screenArea > 0 && area * 10L >= screenArea * 7L
+    }
 
-    /** 小爱的对话窗此刻是否压在最上面(坐标点击会点到它身上)。 */
+    private fun foregroundRoot(): AccessibilityNodeInfo? {
+        val visible = (windows ?: emptyList()).mapNotNull { w ->
+            if (w.type != android.view.accessibility.AccessibilityWindowInfo.TYPE_APPLICATION)
+                return@mapNotNull null
+            val root = w.root ?: return@mapNotNull null
+            val pkg = root.packageName?.toString() ?: return@mapNotNull null
+            if (pkg.startsWith("com.android.systemui") || pkg.startsWith("miui.systemui"))
+                return@mapNotNull null
+            if ((pkg == VOICE_ASSIST || pkg == SELF_PKG) && !windowIsLarge(w))
+                return@mapNotNull null
+            ForegroundCandidate(root, pkg, w.layer, w.isFocused, w.isActive)
+        }
+        // Focus and active state outrank the visible launcher or stale windows.
+        val chosen = visible.sortedWith(
+            compareByDescending<ForegroundCandidate> { it.focused }
+                .thenByDescending { it.active }
+                .thenByDescending { it.pkg != "com.miui.home" }
+                .thenByDescending { it.layer }
+        ).firstOrNull()
+        Log.i(TAG, "window selection=" + (chosen?.pkg ?: "none") +
+            " candidates=" + visible.joinToString {
+                "${it.pkg}[focus=${it.focused},active=${it.active},layer=${it.layer}]"
+            })
+        if (chosen != null) return chosen.root
+        // A potentially unsafe overlay must not be mistaken for the target app.
+        return rootInActiveWindow?.takeIf { root ->
+            val pkg = root.packageName?.toString()
+            pkg != null && pkg != VOICE_ASSIST && pkg != SELF_PKG &&
+                !pkg.startsWith("com.android.systemui") && !pkg.startsWith("miui.systemui")
+        }
+    }
+
     private fun assistantOverlayOnTop(): Boolean =
-        (windows ?: emptyList()).maxByOrNull { it.layer }?.root?.packageName == VOICE_ASSIST
+        (windows ?: emptyList()).maxByOrNull { it.layer }?.let { w ->
+            w.root?.packageName?.toString() == VOICE_ASSIST &&
+                (w.type != android.view.accessibility.AccessibilityWindowInfo.TYPE_APPLICATION || !windowIsLarge(w))
+        } == true
 
     /**
      * 控件是否在屏幕上。不能只信 isVisibleToUser:真机上小爱对话窗盖着时,设置页的列表项
@@ -276,7 +317,10 @@ class UiAutoService : AccessibilityService() {
     }
 
     fun observe(): String = synchronized(uiLock) {
-        val snap = takeSnapshot() ?: return "error: 拿不到前台窗口，无障碍服务可能没连上"
+        val snap = takeSnapshot()
+            ?: return "error: WINDOW_NOT_VISIBLE 未能从无障碍窗口列表读取目标页面"
+        if (snap.pkg == "com.miui.home" && snap.elements.isEmpty())
+            return "error: WINDOW_NOT_VISIBLE 只能读取空白桌面，目标页面可能未被系统无障碍暴露"
         UiPolicy.formatSnapshot(snap.id, snap.pkg, snap.elements, snap.truncated)
     }
 

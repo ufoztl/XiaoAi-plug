@@ -18,6 +18,10 @@ enum class AiProvider(
     val defaultModel: String
 ) {
     OPENAI("openai", "OpenAI 兼容", Wire.OPENAI, "https://api.openai.com/v1", "gpt-4o-mini"),
+    OPENAI_LUNA("openai_luna", "OpenAI · GPT-6 Luna", Wire.OPENAI, "https://api.openai.com/v1", "gpt-6-luna"),
+    OPENAI_SOL("openai_sol", "OpenAI · GPT-6.1 Sol", Wire.OPENAI, "https://api.openai.com/v1", "gpt-6.1-sol"),
+    OPENAI_ASTRA("openai_astra", "OpenAI · GPT-6 Astra", Wire.OPENAI, "https://api.openai.com/v1", "gpt-6-astra"),
+    DEEPSEEK("deepseek", "DeepSeek 官方", Wire.OPENAI, "https://api.deepseek.com", "deepseek-flash"),
     ANTHROPIC("anthropic", "Anthropic", Wire.ANTHROPIC, "https://api.anthropic.com/v1", "claude-opus-4-8"),
     XAI("xai", "xAI (Grok)", Wire.OPENAI, "https://api.x.ai/v1", "grok-4"),
     SILICONFLOW("siliconflow", "硅基流动", Wire.OPENAI, "https://api.siliconflow.cn/v1", "Qwen/Qwen3-8B");
